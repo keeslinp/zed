@@ -1925,6 +1925,21 @@ impl AgentPanel {
         self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
     }
 
+    pub fn new_agent_thread(
+        &mut self,
+        agent: Agent,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_open_project(cx) {
+            return;
+        }
+
+        self.selected_agent = agent;
+        self.activate_new_thread(true, source, window, cx);
+    }
+
     pub fn new_terminal(
         &mut self,
         workspace: Option<&Workspace>,

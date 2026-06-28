@@ -187,6 +187,7 @@ fn assert_remote_project_integration_sidebar_state(
                     terminal.metadata.title
                 );
             }
+            ListEntry::WorktreeHeader(_) => {}
         }
     }
 
@@ -597,6 +598,22 @@ fn visible_entries_as_strings(
                             format!("  {title}{worktree}{live}{status_str}{notified}{selected}")
                         }
                     }
+                    ListEntry::WorktreeHeader(header) => {
+                        let icon = if sidebar.is_worktree_group_collapsed(&header.key) {
+                            ">"
+                        } else {
+                            "v"
+                        };
+                        let branch = header
+                            .branch_name
+                            .as_ref()
+                            .map(|branch| format!(" / {branch}"))
+                            .unwrap_or_default();
+                        format!(
+                            "  {} [{}{}]{}",
+                            icon, header.worktree_name, branch, selected
+                        )
+                    }
                     ListEntry::Terminal(terminal) => {
                         let title = terminal.metadata.display_title();
                         let worktree = format_linked_worktree_chips(&terminal.worktrees);
@@ -606,6 +623,21 @@ fn visible_entries_as_strings(
             })
             .collect()
     })
+}
+
+#[test]
+fn test_sidebar_grouping_serialization_defaults_to_project() {
+    let old_state: SerializedSidebar = serde_json::from_str(r#"{"width":300.0}"#).unwrap();
+    assert_eq!(old_state.grouping, SidebarGrouping::Project);
+
+    let state = SerializedSidebar {
+        width: Some(320.0),
+        active_view: SerializedSidebarView::ThreadList,
+        grouping: SidebarGrouping::Worktree,
+    };
+    let serialized = serde_json::to_string(&state).unwrap();
+    let restored: SerializedSidebar = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(restored.grouping, SidebarGrouping::Worktree);
 }
 
 #[gpui::test]
@@ -809,6 +841,7 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
     let serialized = serde_json::to_string(&SerializedSidebar {
         width: Some(400.0),
         active_view: SerializedSidebarView::History,
+        grouping: SidebarGrouping::Project,
     })
     .expect("serialization should succeed");
 
@@ -4964,7 +4997,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::WorktreeHeader(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -5050,7 +5085,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::WorktreeHeader(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -5089,7 +5126,9 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::WorktreeHeader(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -6320,6 +6359,181 @@ async fn test_search_matches_worktree_name(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_grouping_by_worktree_nests_threads_and_searches_branch(cx: &mut TestAppContext) {
+    let (project, fs) = init_test_project_with_git("/project", cx).await;
+
+    fs.as_fake()
+        .add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            false,
+            git::repository::Worktree {
+                path: PathBuf::from("/wt/rosewood"),
+                ref_name: Some("refs/heads/feature-branch".into()),
+                sha: "abc".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let worktree_project = project::Project::test(fs.clone(), ["/wt/rosewood".as_ref()], cx).await;
+    worktree_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(worktree_project.clone(), window, cx)
+    });
+
+    save_named_thread_metadata("main-thread", "Main Thread", &project, cx).await;
+    save_named_thread_metadata("worktree-thread", "Worktree Thread", &worktree_project, cx).await;
+
+    sidebar.update_in(cx, |sidebar, _window, cx| {
+        sidebar.set_grouping(SidebarGrouping::Worktree, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [project]",
+            "  v [project / main]",
+            "  Main Thread",
+            "  v [rosewood / feature-branch]",
+            "  Worktree Thread {rosewood}",
+        ],
+    );
+
+    let worktree_key = sidebar
+        .read_with(cx, |sidebar, _cx| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListEntry::WorktreeHeader(header)
+                        if header.worktree_name.as_ref() == "rosewood" =>
+                    {
+                        Some(header.key.clone())
+                    }
+                    _ => None,
+                })
+        })
+        .expect("rosewood worktree header should be present");
+
+    sidebar.update_in(cx, |sidebar, _window, cx| {
+        sidebar.set_worktree_group_expanded(&worktree_key, false);
+        sidebar.update_entries(cx);
+    });
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [project]",
+            "  v [project / main]",
+            "  Main Thread",
+            "  > [rosewood / feature-branch]",
+        ],
+    );
+
+    type_in_search(&sidebar, "feature-branch", cx);
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [project]",
+            "  > [rosewood / feature-branch]",
+            "  Worktree Thread {rosewood}  <== selected",
+        ],
+    );
+}
+
+#[gpui::test]
+async fn test_worktree_header_plus_creates_thread_in_worktree(cx: &mut TestAppContext) {
+    let (project, fs) = init_test_project_with_git("/project", cx).await;
+
+    fs.as_fake()
+        .add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            false,
+            git::repository::Worktree {
+                path: PathBuf::from("/wt/rosewood"),
+                ref_name: Some("refs/heads/feature-branch".into()),
+                sha: "abc".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let worktree_project = project::Project::test(fs.clone(), ["/wt/rosewood".as_ref()], cx).await;
+    worktree_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let worktree_workspace = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(worktree_project.clone(), window, cx)
+    });
+    let worktree_panel = add_agent_panel(&worktree_workspace, cx);
+
+    save_named_thread_metadata("worktree-thread", "Worktree Thread", &worktree_project, cx).await;
+    sidebar.update_in(cx, |sidebar, _window, cx| {
+        sidebar.set_grouping(SidebarGrouping::Worktree, cx);
+    });
+    cx.run_until_parked();
+
+    let worktree_key = sidebar
+        .read_with(cx, |sidebar, _cx| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListEntry::WorktreeHeader(header)
+                        if header.worktree_name.as_ref() == "rosewood" =>
+                    {
+                        Some(header.key.clone())
+                    }
+                    _ => None,
+                })
+        })
+        .expect("rosewood worktree header should be present");
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.create_agent_thread_in_worktree(&worktree_key, Agent::NativeAgent, window, cx);
+    });
+    cx.run_until_parked();
+
+    let draft_id = worktree_panel.read_with(cx, |panel, cx| {
+        panel
+            .active_thread_id(cx)
+            .expect("worktree panel should have an active draft")
+    });
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert!(
+            matches!(
+                &sidebar.active_entry,
+                Some(ActiveEntry::Thread { thread_id, workspace, .. })
+                    if *thread_id == draft_id && workspace == &worktree_workspace
+            ),
+            "new draft should be active in the linked worktree workspace"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_git_worktree_added_live_updates_sidebar(cx: &mut TestAppContext) {
     let (project, fs) = init_test_project_with_git("/project", cx).await;
 
@@ -7139,6 +7353,7 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                         terminal.metadata.title
                     );
                 }
+                ListEntry::WorktreeHeader(_) => {}
             }
         }
 
