@@ -267,6 +267,7 @@ enum WorktreeEntry {
     CreateFromDefaultBranch {
         default_branch: RemoteBranchName,
     },
+    CreateFromOtherBranch,
     Separator,
     SectionHeader(SharedString),
     Worktree {
@@ -402,7 +403,7 @@ impl Render for DeleteWorktreeTooltip {
 
 impl WorktreePickerDelegate {
     fn build_fixed_entries(&self) -> Vec<WorktreeEntry> {
-        worktree_create_targets(
+        let mut entries = worktree_create_targets(
             self.has_multiple_repositories,
             self.default_branch.clone(),
             self.current_branch_name.as_deref(),
@@ -414,7 +415,13 @@ impl WorktreePickerDelegate {
                 WorktreeEntry::CreateFromDefaultBranch { default_branch }
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+        if !self.has_multiple_repositories {
+            entries.push(WorktreeEntry::CreateFromOtherBranch);
+        }
+
+        entries
     }
 
     fn all_repo_worktrees(&self) -> &[GitWorktree] {
@@ -974,6 +981,60 @@ impl PickerDelegate for WorktreePickerDelegate {
                     });
                 }
             }
+            WorktreeEntry::CreateFromOtherBranch => {
+                if self.creation_blocked_reason(cx).is_some() {
+                    return;
+                }
+                if let Some(workspace) = self.workspace.upgrade() {
+                    let repository = self.project.read(cx).active_repository(cx);
+                    let workspace_handle = self.workspace.clone();
+                    let callback_workspace_handle = workspace_handle.clone();
+                    let focused_dock = self.focused_dock;
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            crate::branch_picker::select_modal_including_tracked_remotes(
+                                workspace_handle,
+                                repository,
+                                None,
+                                Arc::new(move |branch, window, cx| {
+                                    let branch_target = if branch.is_remote() {
+                                        let remote_name = branch.remote_name().unwrap_or("origin");
+                                        let prefix = format!("refs/remotes/{remote_name}/");
+                                        let branch_name = branch
+                                            .ref_name
+                                            .strip_prefix(&prefix)
+                                            .unwrap_or(branch.name());
+                                        NewWorktreeBranchTarget::RemoteBranch {
+                                            remote_name: remote_name.to_string(),
+                                            branch_name: branch_name.to_string(),
+                                        }
+                                    } else {
+                                        NewWorktreeBranchTarget::ExistingBranch {
+                                            name: branch.name().to_string(),
+                                        }
+                                    };
+                                    if let Some(workspace) = callback_workspace_handle.upgrade() {
+                                        workspace.update(cx, |workspace, cx| {
+                                            crate::worktree_service::handle_create_worktree(
+                                                workspace,
+                                                &CreateWorktree {
+                                                    worktree_name: None,
+                                                    branch_target,
+                                                },
+                                                window,
+                                                focused_dock,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                                window,
+                                cx,
+                            )
+                        });
+                    });
+                }
+            }
             WorktreeEntry::Worktree { worktree, .. } => {
                 if self.deleting_worktree_paths.contains(&worktree.path) {
                     return;
@@ -1101,6 +1162,18 @@ impl PickerDelegate for WorktreePickerDelegate {
                 let item = create_new_list_item(
                     "create-from-main".to_string().into(),
                     label.into(),
+                    self.creation_blocked_reason(cx),
+                    selected,
+                );
+
+                Some(item.into_any_element())
+            }
+            WorktreeEntry::CreateFromOtherBranch => {
+                let item = create_new_list_item(
+                    "create-from-other-branch".to_string().into(),
+                    "Create new worktree based on other branch..."
+                        .to_string()
+                        .into(),
                     self.creation_blocked_reason(cx),
                     selected,
                 );
@@ -1361,6 +1434,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                 e,
                 WorktreeEntry::CreateFromCurrentBranch
                     | WorktreeEntry::CreateFromDefaultBranch { .. }
+                    | WorktreeEntry::CreateFromOtherBranch
                     | WorktreeEntry::CreateNamed { .. }
             )
         });

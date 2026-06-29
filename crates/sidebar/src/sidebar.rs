@@ -3214,6 +3214,47 @@ impl Sidebar {
                                     });
                                 }
 
+                                if !has_multiple_repositories {
+                                    let workspace = base_workspace.clone();
+                                    submenu = submenu.entry("Based on Other Branch…", None, move |window, cx| {
+                                        let repository = workspace.read(cx).project().read(cx).active_repository(cx);
+                                        let modal_workspace_handle = workspace.downgrade();
+                                        let callback_workspace = workspace.clone();
+                                        workspace.update(cx, |workspace, cx| {
+                                            workspace.toggle_modal(window, cx, |window, cx| {
+                                                git_ui::branch_picker::select_modal_including_tracked_remotes(
+                                                    modal_workspace_handle,
+                                                    repository,
+                                                    None,
+                                                    Arc::new(move |branch, window, cx| {
+                                                        let branch_target = if branch.is_remote() {
+                                                            let remote_name = branch.remote_name().unwrap_or("origin");
+                                                            let prefix = format!("refs/remotes/{remote_name}/");
+                                                            let branch_name = branch.ref_name.strip_prefix(&prefix).unwrap_or(branch.name());
+                                                            NewWorktreeBranchTarget::RemoteBranch {
+                                                                remote_name: remote_name.to_string(),
+                                                                branch_name: branch_name.to_string(),
+                                                            }
+                                                        } else {
+                                                            NewWorktreeBranchTarget::ExistingBranch {
+                                                                name: branch.name().to_string(),
+                                                            }
+                                                        };
+                                                        create_worktree_in_workspace(
+                                                            &callback_workspace,
+                                                            branch_target,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }),
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        });
+                                    });
+                                }
+
                                 submenu
                             }
                         });
