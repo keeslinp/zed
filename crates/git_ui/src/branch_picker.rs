@@ -114,6 +114,7 @@ pub fn select_popover(
             rems(20.),
             selected_branch,
             on_select,
+            RemoteUpstreamBranches::Collapse,
             window,
             cx,
         );
@@ -137,6 +138,30 @@ pub fn select_modal(
         rems(34.),
         selected_branch,
         on_select,
+        RemoteUpstreamBranches::Collapse,
+        window,
+        cx,
+    );
+    list.focus_handle(cx).focus(window, cx);
+    list
+}
+
+pub fn select_modal_including_tracked_remotes(
+    workspace: WeakEntity<Workspace>,
+    repository: Option<Entity<Repository>>,
+    selected_branch: Option<SharedString>,
+    on_select: SelectBranchCallback,
+    window: &mut Window,
+    cx: &mut Context<BranchList>,
+) -> BranchList {
+    let list = BranchList::new_select(
+        workspace,
+        repository,
+        BranchListStyle::Modal,
+        rems(34.),
+        selected_branch,
+        on_select,
+        RemoteUpstreamBranches::Include,
         window,
         cx,
     );
@@ -215,6 +240,7 @@ impl BranchList {
         width: Rems,
         selected_branch: Option<SharedString>,
         on_select: SelectBranchCallback,
+        remote_upstream_branches: RemoteUpstreamBranches,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -227,6 +253,7 @@ impl BranchList {
             BranchSelectionBehavior::Select {
                 selected_branch,
                 on_select,
+                remote_upstream_branches,
             },
             window,
             cx,
@@ -254,6 +281,7 @@ impl BranchList {
                 process_branches(
                     &repo.read(cx).branch_list,
                     branch_selection_behavior.selected_branch(),
+                    branch_selection_behavior.remote_upstream_branches(),
                 )
             })
             .unwrap_or_default();
@@ -308,6 +336,10 @@ impl BranchList {
                             picker.delegate.all_branches = process_branches(
                                 &branch_list,
                                 picker.delegate.branch_selection_behavior.selected_branch(),
+                                picker
+                                    .delegate
+                                    .branch_selection_behavior
+                                    .remote_upstream_branches(),
                             );
                             picker.delegate.branch_list_error = branch_list_error;
                             picker.refresh(window, cx);
@@ -548,6 +580,7 @@ enum BranchSelectionBehavior {
     Select {
         selected_branch: Option<SharedString>,
         on_select: SelectBranchCallback,
+        remote_upstream_branches: RemoteUpstreamBranches,
     },
 }
 
@@ -564,6 +597,22 @@ impl BranchSelectionBehavior {
     fn is_select_only(&self) -> bool {
         matches!(self, Self::Select { .. })
     }
+
+    fn remote_upstream_branches(&self) -> RemoteUpstreamBranches {
+        match self {
+            Self::Checkout => RemoteUpstreamBranches::Collapse,
+            Self::Select {
+                remote_upstream_branches,
+                ..
+            } => *remote_upstream_branches,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RemoteUpstreamBranches {
+    Collapse,
+    Include,
 }
 
 #[derive(Clone)]
@@ -796,6 +845,7 @@ fn sort_branch_entries(
 fn process_branches(
     branches: &Arc<[Branch]>,
     preserved_branch: Option<&SharedString>,
+    remote_upstream_branches: RemoteUpstreamBranches,
 ) -> Vec<Branch> {
     let remote_upstreams: HashSet<_> = branches
         .iter()
@@ -811,7 +861,8 @@ fn process_branches(
     let mut result: Vec<Branch> = branches
         .iter()
         .filter(|branch| {
-            !remote_upstreams.contains(&branch.ref_name)
+            matches!(remote_upstream_branches, RemoteUpstreamBranches::Include)
+                || !remote_upstreams.contains(&branch.ref_name)
                 || preserved_branch
                     .as_ref()
                     .is_some_and(|preserved_branch| branch_matches_ref(branch, preserved_branch))
@@ -2008,7 +2059,11 @@ mod tests {
             create_test_branch("main", false, Some("fork"), Some(800)),
         ]);
 
-        let processed_branches = process_branches(&branches, Some(&selected_branch));
+        let processed_branches = process_branches(
+            &branches,
+            Some(&selected_branch),
+            RemoteUpstreamBranches::Collapse,
+        );
         assert!(
             processed_branches
                 .iter()
@@ -2046,6 +2101,35 @@ mod tests {
                     .iter()
                     .position(|name| *name == "fork/main"),
             "branches on the active branch's remote should be prioritized"
+        );
+    }
+
+    #[test]
+    fn test_select_branch_can_include_remote_upstreams() {
+        let branches: Arc<[Branch]> = Arc::from([
+            create_test_branch_with_upstream(
+                "main",
+                true,
+                None,
+                Some(1100),
+                Some("refs/remotes/origin/main"),
+            ),
+            create_test_branch("main", false, Some("origin"), Some(1000)),
+        ]);
+
+        let processed_branches = process_branches(&branches, None, RemoteUpstreamBranches::Include);
+        let branch_names = processed_branches
+            .iter()
+            .map(|branch| branch.name())
+            .collect::<Vec<_>>();
+
+        assert!(
+            branch_names.contains(&"main"),
+            "the local tracking branch should remain selectable"
+        );
+        assert!(
+            branch_names.contains(&"origin/main"),
+            "the tracked remote branch should remain selectable"
         );
     }
 
